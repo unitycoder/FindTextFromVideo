@@ -8,9 +8,13 @@ I recorded +1hr clip that had some personal info in few frames, but cannot find 
 Still have things todo https://github.com/unitycoder/FindTextFromVideo/issues/2
 
 ### Installation
+- Clone repo
+- Open project in Visual Studio
 - Download Tesseract language file from https://github.com/tesseract-ocr/tessdata
 - If you use English, then take: https://github.com/tesseract-ocr/tessdata/raw/refs/heads/main/eng.traineddata
-- Place data file in tessdata/ folder next to your FindTextFromVideo.exe file
+- Place data file in the build output folder, under: tessdata/ next to where your FindTextFromVideo.exe file is
+- Build it
+- Use from commandline
 
 ### Usage
 - FindTextFromVideo.exe "text to search" videofile.mkv
