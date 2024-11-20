@@ -1,24 +1,29 @@
 ﻿using OpenCvSharp;
+using System.Collections.Concurrent;
 using System.Diagnostics;
 using Tesseract;
 
 namespace FindTextFromVideo
 {
-
     class Program
     {
         static void Main(string[] args)
         {
-            // Validate input arguments
             if (args.Length < 3)
             {
-                Console.WriteLine("Usage: FindTextFromVideo.exe \"<text to find>\" <video path> <output text file>");
+                Console.WriteLine("Usage: FindTextFromVideo.exe \"<text to find>\" <video path> <output text file> [skip frames]");
                 return;
             }
 
             string searchText = args[0].Trim('"'); // Remove quotes if present
             string videoPath = args[1];
             string outputTextFile = args[2];
+
+            int skipFrames = 1; // Default to no skipping
+            if (args.Length >= 4 && int.TryParse(args[3], out var skip))
+            {
+                skipFrames = Math.Max(1, skip); // Ensure skip is at least 1
+            }
 
             if (string.IsNullOrEmpty(searchText))
             {
@@ -44,87 +49,147 @@ namespace FindTextFromVideo
 
                     int frameCount = (int)videoCapture.Get(VideoCaptureProperties.FrameCount);
                     double fps = videoCapture.Get(VideoCaptureProperties.Fps); // Frames per second
-                    Console.WriteLine($"Video loaded. Frame count: {frameCount}, FPS: {fps}");
+                    Console.WriteLine($"Video loaded. Frame count: {frameCount}, FPS: {fps}, Skip Frames: {skipFrames}");
 
-                    var frame = new Mat();
-                    int frameIndex = 0;
-                    int detectedCount = 0;
+                    var frames = new ConcurrentBag<(int FrameIndex, Mat Frame)>();
+                    var results = new ConcurrentDictionary<int, string>();
+                    object fileLock = new object();
 
-                    // Timer to track progress
-                    Stopwatch stopwatch = Stopwatch.StartNew();
-
-                    // Initialize Tesseract
-                    using (var tesseractEngine = new TesseractEngine("./tessdata", "eng", EngineMode.Default))
+                    // Initialize output file
+                    using (var writer = new StreamWriter(outputTextFile))
                     {
-                        using (var writer = new StreamWriter(outputTextFile))
+                        writer.WriteLine("Frame Index\tTimestamp\tOCR Text");
+                    }
+
+                    // Timer for extraction
+                    Stopwatch extractionStopwatch = Stopwatch.StartNew();
+
+                    // Extract all frames with progress bar
+                    Console.WriteLine("Extracting frames...");
+                    for (int i = 0; i < frameCount; i += skipFrames)
+                    {
+                        Mat frame = new Mat();
+                        videoCapture.Set(VideoCaptureProperties.PosFrames, i);
+                        videoCapture.Read(frame);
+                        if (frame.Empty()) break;
+
+                        frames.Add((i, frame));
+
+                        // Update progress bar for extraction
+                        double extractionProgress = (double)(i + 1) / frameCount;
+                        TimeSpan elapsedTime = extractionStopwatch.Elapsed;
+                        TimeSpan estimatedTotalTime = TimeSpan.FromTicks((long)(elapsedTime.Ticks / extractionProgress));
+                        TimeSpan remainingTime = estimatedTotalTime - elapsedTime;
+
+                        Console.Write($"\rExtracting: [{new string('#', (int)(extractionProgress * 50))}{new string('-', 50 - (int)(extractionProgress * 50))}] {extractionProgress * 100:F2}% | Elapsed: {elapsedTime:hh\\:mm\\:ss} | Remaining: {remainingTime:hh\\:mm\\:ss}");
+                    }
+
+                    Console.WriteLine($"\nExtraction complete. Extracted {frames.Count} frames.");
+
+                    // Timer for processing
+                    Stopwatch processingStopwatch = Stopwatch.StartNew();
+
+                    int detectedCount = 0;
+                    int processedFrames = 0;
+
+                    // Process frames in parallel with progress bar
+                    Console.WriteLine("Processing frames...");
+                    Parallel.ForEach(frames, new ParallelOptions { MaxDegreeOfParallelism = Environment.ProcessorCount - 1 }, frameData =>
+                    {
+                        int frameIndex = frameData.FrameIndex;
+                        Mat frame = frameData.Frame;
+
+                        // Convert the frame to grayscale for better OCR performance
+                        Mat grayFrame = new Mat();
+                        Cv2.CvtColor(frame, grayFrame, ColorConversionCodes.BGR2GRAY);
+
+                        // Use Tesseract for OCR
+                        using (var tesseractEngine = new TesseractEngine("./tessdata", "eng", EngineMode.Default))
                         {
-                            writer.WriteLine("Frame Index\tTimestamp\tOCR Text");
-                            while (true)
+                            using (var bitmap = OpenCvSharp.Extensions.BitmapConverter.ToBitmap(grayFrame))
                             {
-                                videoCapture.Read(frame);
-
-                                if (frame.Empty())
+                                using (var ms = new MemoryStream())
                                 {
-                                    break; // End of video
-                                }
+                                    bitmap.Save(ms, System.Drawing.Imaging.ImageFormat.Png);
+                                    ms.Seek(0, SeekOrigin.Begin);
 
-                                // Convert the frame to grayscale for better OCR performance
-                                Mat grayFrame = new Mat();
-                                Cv2.CvtColor(frame, grayFrame, ColorConversionCodes.BGR2GRAY);
-
-                                // Convert frame to a bitmap for Tesseract
-                                using (var bitmap = OpenCvSharp.Extensions.BitmapConverter.ToBitmap(grayFrame))
-                                {
-                                    using (var ms = new MemoryStream())
+                                    using (var pix = Pix.LoadFromMemory(ms.ToArray()))
                                     {
-                                        // Save the Bitmap to MemoryStream as PNG
-                                        bitmap.Save(ms, System.Drawing.Imaging.ImageFormat.Png);
-                                        ms.Seek(0, SeekOrigin.Begin);
-
-                                        // Load Pix from memory stream
-                                        using (var pix = Pix.LoadFromMemory(ms.ToArray()))
+                                        using (var page = tesseractEngine.Process(pix))
                                         {
-                                            // Perform OCR on the frame
-                                            using (var page = tesseractEngine.Process(pix))
+                                            string ocrText = page.GetText();
+
+                                            // Calculate timestamp
+                                            double seconds = frameIndex / fps;
+                                            TimeSpan timestamp = TimeSpan.FromSeconds(seconds);
+
+                                            // Add result to dictionary
+                                            results[frameIndex] = $"{frameIndex}\t{timestamp:hh\\:mm\\:ss\\.fff}\t{ocrText.Replace("\n", " ")}";
+
+                                            // Check if the search text is found
+                                            if (ocrText.Contains(searchText, StringComparison.OrdinalIgnoreCase))
                                             {
-                                                string ocrText = page.GetText();
+                                                Console.WriteLine($"\nText found in frame {frameIndex} at timestamp {timestamp:hh\\:mm\\:ss\\.fff}");
+                                                Interlocked.Increment(ref detectedCount);
+                                            }
 
-                                                // Calculate timestamp
-                                                double seconds = frameIndex / fps;
-                                                TimeSpan timestamp = TimeSpan.FromSeconds(seconds);
-
-                                                // Write OCR text to the output file
-                                                writer.WriteLine($"{frameIndex}\t{timestamp:hh\\:mm\\:ss\\.fff}\t{ocrText.Replace("\n", " ")}");
-
-                                                // Check if the search text is found
-                                                if (ocrText.Contains(searchText, StringComparison.OrdinalIgnoreCase))
+                                            // Periodic file update
+                                            if (processedFrames % 10 == 0) // Update file every 10 frames
+                                            {
+                                                lock (fileLock)
                                                 {
-                                                    Console.WriteLine($"\nText found in frame {frameIndex} at timestamp {timestamp:hh\\:mm\\:ss\\.fff}");
-                                                    detectedCount++;
+                                                    using (var writer = new StreamWriter(outputTextFile, append: true))
+                                                    {
+                                                        foreach (var key in results.Keys.OrderBy(k => k))
+                                                        {
+                                                            if (results.TryRemove(key, out var line))
+                                                            {
+                                                                writer.WriteLine(line);
+                                                            }
+                                                        }
+                                                    }
                                                 }
                                             }
                                         }
                                     }
                                 }
+                            }
+                        }
 
-                                grayFrame.Dispose();
+                        grayFrame.Dispose();
 
-                                // Progress bar and time calculation
-                                frameIndex++;
-                                double progress = (double)frameIndex / frameCount;
-                                TimeSpan elapsedTime = stopwatch.Elapsed;
-                                TimeSpan estimatedTotalTime = TimeSpan.FromTicks((long)(elapsedTime.Ticks / progress));
-                                TimeSpan remainingTime = estimatedTotalTime - elapsedTime;
+                        // Update progress bar for processing
+                        Interlocked.Increment(ref processedFrames);
+                        double processingProgress = (double)processedFrames / frames.Count;
+                        TimeSpan processingElapsed = processingStopwatch.Elapsed;
+                        TimeSpan processingEstimatedTotalTime = TimeSpan.FromTicks((long)(processingElapsed.Ticks / processingProgress));
+                        TimeSpan processingRemainingTime = processingEstimatedTotalTime - processingElapsed;
 
-                                Console.Write($"\rProcessing: [{new string('#', (int)(progress * 50))}{new string('-', 50 - (int)(progress * 50))}] {progress * 100:F2}% | Elapsed: {elapsedTime:hh\\:mm\\:ss} | Remaining: {remainingTime:hh\\:mm\\:ss}");
+                        Console.Write($"\rProcessing: [{new string('#', (int)(processingProgress * 50))}{new string('-', 50 - (int)(processingProgress * 50))}] {processingProgress * 100:F2}% | Elapsed: {processingElapsed:hh\\:mm\\:ss} | Remaining: {processingRemainingTime:hh\\:mm\\:ss}");
+                    });
+
+                    // Write remaining results to file
+                    Console.WriteLine("\nFinalizing output...");
+                    lock (fileLock)
+                    {
+                        using (var writer = new StreamWriter(outputTextFile, append: true))
+                        {
+                            foreach (var key in results.Keys.OrderBy(k => k))
+                            {
+                                if (results.TryRemove(key, out var line))
+                                {
+                                    writer.WriteLine(line);
+                                }
                             }
                         }
                     }
 
+                    processingStopwatch.Stop();
+
                     Console.WriteLine("\nProcessing complete.");
-                    Console.WriteLine($"Total frames processed: {frameCount}");
+                    Console.WriteLine($"Total frames processed: {frames.Count}");
                     Console.WriteLine($"Total frames with text found: {detectedCount}");
-                    Console.WriteLine($"OCR text saved to: {outputTextFile}");
+                    Console.WriteLine($"Elapsed time: {processingStopwatch.Elapsed:hh\\:mm\\:ss}");
                 }
             }
             catch (Exception ex)
@@ -133,5 +198,4 @@ namespace FindTextFromVideo
             }
         }
     }
-
-} // namespace
+}
